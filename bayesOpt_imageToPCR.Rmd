@@ -1,0 +1,568 @@
+---
+title: "Attempt at Bayesian Optimization for Nanotpography exploration"
+output: html_notebook
+---
+This notebook shows results for optimizing the morphome with respect to osteogenesis, but performed per geometry!
+
+Notes specifically for Bayesian optimization protocol/algorithm:
+- Morphome data used: 243 features that were already used to model morphology to gene expression
+- Morphome is mean centered and scaled (mean = 0, sd=1) across both replicates
+- Note that Y data we are trying to optimize is just the weighted sum of bone gene expression, normalized to (0,1] by dividing by the maximum across 2 replicates
+- No separation made between SQ or HEX data but FLAT data are all excluded
+- Uses averaage of PCR data per replicate
+- The GP model used in the Bayesian optimization does not have the optimizer
+- The random search was performed by just getting a random datapoint within the available dataset, but the maximum Y is computed from a GP model using the random dataset
+
+Call functions needed from R.
+```{r message=FALSE, warning=FALSE}
+#set up all the libraries that you'll be needing here
+library(reticulate)
+library(ggplot2)
+library(tidyverse)
+library(caret)
+library(tidyverse)
+library(reshape2)
+library(glue)
+library(brms)
+use_condaenv(condaenv = 'python36', required = TRUE)
+```
+
+Import the dataset we need
+```{r message=FALSE, warning=FALSE}
+#data import
+#choose which data to perform Bayesian optimization on
+allData <- read_csv("meanBayesOptData_noFlat.csv")
+
+
+```
+
+Get predictive models created using Bayesian linear regression (brms):
+```{r}
+load("~/RProjects/BayesianOptimization_imageToPcr/scaledData_griditerate/imageBasedModels2.RData")
+
+
+#studentTModel_base_topoPrediction_geom1 predicts HEX topography from image features
+
+
+#note that imageBasedModels2 contain the following models: 
+#studentModels that have multiple response predictions for (log) genes, for HEX (geom1) and SQ (geom2) separately from X + X^2
+#studentTModels that have multiple prediction of (byMax) disorder and diameter from image features X, for HEX (geom1) and SQ (geom2) separately
+
+```
+
+We need to show that we can model morphome to PCR using a GP regression. This goes wihtout saying anyway, as GP is probably better than just a simple Bayes opt. 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#perform a gp regression to show that we can do it with the current dataset
+rm('gp_modeling_split.py')
+source_python('gp_modeling_split.py')
+
+for (g in 1:2){
+   geomData <- subset(allData, allData$Geometry_Number == g)
+   xraw = as.data.frame(geomData[,18:260])
+   names(xraw)[1] <- "X1"
+   xmean = lapply(xraw,mean)
+   xsd = lapply(xraw, sd)
+   x = as.data.frame((xraw-xmean)/xsd)
+   yraw = as.data.frame(geomData[,14:17])
+   ylog = log(yraw, 10)
+   ymax = unlist(lapply(ylog, max))
+   y = ylog/ymax
+   imagetopcr_model <- gp_modeling_split(x=x, y=y)
+   assign(glue("imagetopcr_model_geom{g}"), imagetopcr_model)
+   assign(glue("x_geom_{g}"), x)
+   assign(glue("y_geom_{g}"), y)
+   
+   #to get values of the kernel that has seen the data
+   #kern_bayesopt <- topotopcr_model_base[[2]]
+   #kern_rnd <- topotopcr_model_base[[2]]
+   
+   #to get initial values for the kernel
+   kern_bayesopt <- imagetopcr_model[[9]]
+   kern_rnd <- imagetopcr_model[[9]]
+   
+   assign(glue("kern_bayesopt_{g}"), kern_bayesopt)
+   assign(glue("kern_rnd_{g}"), kern_rnd)
+ }
+
+```
+
+
+Plot of the GP regression
+```{r}
+ypred <- NULL
+yactual <- NULL
+geometryHolder <- NULL
+ydata <- NULL
+
+for(g in 1:2){
+   gpModelToUse<-get(glue("imagetopcr_model_geom{g}"))
+   ypred<-  unlist(gpModelToUse[[6]])
+   names(ypred)[1] <- "train"
+   yactual <- unlist(gpModelToUse[[8]])
+   names(yactual)[1] <- "test"
+   ydataHolder <- as.data.frame(cbind(ypred, yactual))
+   ydataHolder$geometry <- g
+   ydata <- rbind(ydata, ydataHolder)
+}
+   ggplot(ydata, aes(x=ypred, y=yactual)) + geom_point() + geom_abline(color="red") + facet_wrap(~geometry)
+   
+```
+
+
+```{r}
+print(paste0("MAE using GP regression is (original data):", MAE(ydata[,1], ydata[,2])))
+```
+```{r}
+print(paste0("MAE using GP regression is (scaled Y data):", imagetopcr_model[[3]]))
+```
+
+
+
+Bayesian Optimization Scenario 1. Let's try to see if the Bayesian Optimization protocol can be used to more efficiently sample the known morphome space to maximize PCR. Recall that for Bayesian optimization, we only use the weighted sum of Genes4-Genes7 (single objective optimization). 
+```{r message=FALSE, warning=FALSE}
+rm('bayesian_optimization_nogrid')
+source_python('bayesian_optimization_real_noGrid2.py')
+
+#set some parameters here
+exp = 50
+offset = 5
+all_ymax_bayesopt <- NULL
+all_ymax_rnd <- NULL
+all_ind_bayesopt <- NULL
+all_ind_rnd <- NULL
+all_experiment <- NULL
+all_iterations <- NULL
+
+
+for(g in 1:2){
+   geomData <- subset(allData, allData$Geometry_Number == g)
+   xraw = as.data.frame(geomData[,18:260])
+   names(xraw)[1] <- "X1"
+   xmean = lapply(xraw,mean)
+   xsd = lapply(xraw, sd)
+   x = as.data.frame((xraw-xmean)/xsd)
+   yraw = as.data.frame(geomData[,265])
+   ylog = log10(yraw)
+   ymax = unlist(lapply(ylog, max))
+   y = ylog/ymax
+   maxiter = nrow(x)-1
+   allImageToPcr <- NULL
+   indexBayesOptMax <- NULL
+   indexRndMax <- NULL
+   holderIndexBayesOptMax <- NULL
+   holderIndexRndMax <- NULL
+   
+   for (num in 1:exp){
+      
+    i=1
+    set.seed(num*162+972)
+    ind_bayesopt = list(sample(1:nrow(x)-1, 1, replace=F))
+    ind_rnd = list(sample(1:nrow(x)-1, 1, replace=F))
+    all_ymax_bayesopt <- y[unlist(ind_bayesopt)+1,]
+    all_ymax_rnd <- y[unlist(ind_rnd)+1,]
+    active_ind_bayesopt <- ind_bayesopt
+    active_ind_rnd <- ind_rnd
+    all_iterations <- i
+    all_experiment <- num
+    
+    kern_bayesopt <- get(glue("kern_bayesopt_{g}"))
+    kern_rnd <- get(glue("kern_rnd_{g}"))
+   
+      for (i in 1:maxiter){
+         
+         res <- bayesian_optimization_nogrid(x=x, y=y, ind_active_bayesopt=active_ind_bayesopt, ind_active_rnd=active_ind_rnd, kernel_bayesopt=kern_bayesopt, n_offset_bayesopt=offset, iter=i)
+         
+         active_ind_bayesopt <- rbind(active_ind_bayesopt, unlist(res[[3]]))
+         active_ind_rnd <- rbind(active_ind_rnd, unlist(res[[4]]))
+         ind_bayesopt <- rbind(ind_bayesopt, unlist(res[[3]]))
+         ind_rnd <- rbind(ind_rnd, unlist(res[[4]]))
+         y_best_bayesopt_iter <- res[[5]]
+         y_best_rnd_iter <- res[[6]]
+         kern_bayesopt <- res[[7]]
+         all_ymax_bayesopt <- rbind(all_ymax_bayesopt, unlist(y_best_bayesopt_iter))
+         all_ymax_rnd <- rbind(all_ymax_rnd, unlist(y_best_rnd_iter))
+         all_experiment <- rbind(all_experiment, num) 
+         all_iterations <- rbind(all_iterations, i)
+         #print(ind_bayesopt)
+         #print(y_best_bayesopt_iter)
+         
+      }
+    
+   holder <- bind_cols(ymax_bayesopt = all_ymax_bayesopt, ymax_rnd = all_ymax_rnd, chosen_bayesopt_index = unlist(ind_bayesopt), chosen_rnd_index = unlist(ind_rnd), experiment = all_experiment, iterations = all_iterations)
+   holder$geometry <- g
+   allImageToPcr <- rbind(allImageToPcr, holder)
+   
+   holderIndexBayesOptMax <- rbind(holderIndexBayesOptMax,  min(which(holder$ymax_bayesopt == max(holder$ymax_bayesopt))))
+   holderIndexBayesOptMax <- as.data.frame(holderIndexBayesOptMax)
+   holderIndexBayesOptMax$geometry <- g
+   indexBayesOptMax <- rbind(indexBayesOptMax, holderIndexBayesOptMax)
+   
+   holderIndexRndMax <- rbind(holderIndexRndMax,  min(which(holder$ymax_rnd == max(holder$ymax_rnd))))
+   holderIndexRndMax <- as.data.frame(holderIndexRndMax)
+   holderIndexRndMax$geometry <- g
+   indexRndMax <- rbind(indexRndMax, holderIndexRndMax)
+   
+   
+   print(paste0("Experiment Number:", num))
+   }
+   
+  assign(glue("allImageToPcr_geom{g}"), allImageToPcr)
+  assign(glue("indexBayesOptMax_geom{g}"), holderIndexBayesOptMax)
+  assign(glue("indexRndMax_geom{g}"), holderIndexRndMax)
+
+}
+
+allImageToPcr <- NULL
+allImageToPcr <- bind_rows(allImageToPcr_geom1, allImageToPcr_geom2)
+indexBayesOptMax <- rbind(indexBayesOptMax_geom1, indexBayesOptMax_geom2)
+indexRndMax <- rbind(indexRndMax_geom1, indexRndMax_geom2)
+
+write.csv(allImageToPcr, file="allImageToPcr_s1_combGeom.csv")
+write.csv(indexBayesOptMax, file="indexBayesOptMax_s1_combGeom.csv")
+write.csv(indexRndMax, file="indexRndMax_s1_combGeom.csv")
+
+
+allImageToPcr$ExptGeomCombo <- paste0(allImageToPcr$geometry, sep="_", allImageToPcr$experiment)
+allImageToPcr$ExptGeomComboArrange <- factor(allImageToPcr$ExptGeomCombo, levels=c("1_1", "1_2", "1_3", "1_4", "1_5", "2_1", "2_2", "2_3", "2_4", "2_5"))
+
+meltDataYmax <- melt(allImageToPcr[c(1,2,6,7,9)], value.name = "ymax", variable.name = "type", id.vars=c("geometry", "iterations", "ExptGeomComboArrange"))
+
+ggplot(meltDataYmax, aes(x = iterations, y = ymax, color = type)) + 
+   facet_wrap(~ExptGeomComboArrange, scales="free") + 
+   geom_point() + 
+   geom_line() +
+   theme_bw() 
+
+```
+
+Across 50 experiments, the Bayesian optimization protocol reaches maximum faster than a random search does! Yay!
+```{r}
+averageData <- meltDataYmax %>% 
+    group_by(iterations, type, geometry) %>% 
+    summarise(mean.value=mean(ymax), stdev.value = sd(ymax))
+
+ggplot(averageData, aes(x = iterations, y = mean.value, color = type)) + 
+   facet_wrap(~geometry, scales="free") +
+   geom_errorbar(aes(ymin = mean.value - stdev.value, ymax = mean.value + stdev.value), alpha=0.5) + 
+   geom_point() + 
+   geom_line() +
+   theme_bw()
+```
+
+
+```{r}
+for (g in 1:2){
+   averageDataSubset <- subset(averageData, averageData$geometry == g)
+   yMaxIndex<-which(averageDataSubset$mean.value==max(averageDataSubset$mean.value))
+   BayesOptMaxIndex <- averageDataSubset[min(yMaxIndex), 1]
+   RndMaxIndex <- averageDataSubset[min(yMaxIndex[lapply(yMaxIndex, "%%", 2)==0]), 1]
+   print(glue("Max iterations needed by Bayes Opt to get to optimum of geometry {g} is {BayesOptMaxIndex}"))
+   print(glue("Max iterations needed by Rnd to get to optimum of geometry {g} is {RndMaxIndex}"))
+}
+```
+
+Using the predictive model, do we actually obtain the same topography type as the data says we should? 
+```{r}
+#in predictive models, check the position of the disorder, diameter and angles. 
+#in the current models that we use we have:
+#position 1: disorder
+#position 2: diameter
+# bayesOptTopoPredicted <- NULL
+# rndTopoPredicted <- NULL
+# 
+# for(g in 1:2){
+# 
+#    indexBayesOptMaxHolder <- subset(indexBayesOptMax, indexBayesOptMax$geometry == g)
+#    indexRndMaxHolder <- subset(indexRndMax, indexRndMax$geometry == g)
+#    indexBayesOptMaxHolder <- indexBayesOptMaxHolder + 1
+#    indexRndMaxHolder <- indexRndMaxHolder + 1
+#    
+#    for(i in 1:exp){
+#       bayesOptTopoPredictedHolder <- NULL
+#       rndTopoPredictedHolder <- NULL
+#       modelToUse <- get(glue("studentTModel_base_topoPrediction_geom{g}"))
+#       
+#       topoBayesOpt <- t(predict(modelToUse, newdata = x[indexBayesOptMaxHolder[i,1],], draws=50)[c(1,5)])
+#       topoRnd <- t(predict(modelToUse, newdata = x[indexRndMaxHolder[i,1],], draws=50)[c(1,5)])
+#    
+#       #when we scale the data for the linear regression, we scale everything together, not per geometry. but the data that we use here will depend on the model that we ultimately use (Diameter and Disorder by Max??)
+#       bayesOptTopoPredictedHolder <- bind_cols(Disorder = topoBayesOpt[,1]*238.8+132.1, Diameter = topoBayesOpt[,2]*589.7+401.14, Index =indexBayesOptMaxHolder[i,1], geom=g)
+#       rndTopoPredictedHolder <- bind_cols(Disorder = topoRnd[,1]*238.8+132.1, Diameter = topoRnd[,2]*589.7+401.14, Index = indexRndMaxHolder[i,1], geom=g)
+#       
+#       bayesOptTopoPredicted <- bind_rows(bayesOptTopoPredicted, bayesOptTopoPredictedHolder)
+#       rndTopoPredicted <- bind_rows(rndTopoPredicted, rndTopoPredictedHolder)
+#    }
+#       assign(glue("bayesOptTopoPredicted_geom{g}"), bayesOptTopoPredicted)
+#       assign(glue("rndTopoPredicted_geom{g}"), rndTopoPredicted)
+#       write.csv(bayesOptTopoPredicted, file=glue("bayesOptTopoPredicted_geom{g}_s1.csv"))
+#       write.csv(rndTopoPredicted, file=glue("rndTopoPredicted_geom{g}_s1.csv"))
+# }
+#    
+# assign(glue("bayesOptTopoPredicted_combGeom_s1"), bayesOptTopoPredicted)
+# assign(glue("rndTopoPredicted_combGeom_s1"), rndTopoPredicted)
+# 
+# print(paste0("The predicted SQ Disorder and Diameter that lead to max osteogenesis is:",  bayesOptTopoPredicted[1:5,1:2]))
+# print(paste0("The predicted HEX Disorder and Diameter that lead to max osteogenesis is:",  bayesOptTopoPredicted[6:10, 1:2]))
+
+```
+
+We'll skip the normal Bayesian optimization scenario 2. Doesn't seem useful. We'll go straight on to Scenario 3, which is gridToUse search.
+
+```{python}
+# import numpy as np
+# import pandas as pd
+# 
+# #should we generate this within the function instead?
+# num=5
+# 
+# np.random.seed(num*1491+10)
+# numRow = 100
+# numCol = 243
+# ranges = np.asarray([[-3,3]])
+# starts = ranges[:, 0]
+# widths = ranges[:, 1]-ranges[:, 0]
+# gridImages = starts + widths*np.random.random(size=(numRow, numCol))
+# gridImages = pd.DataFrame(gridImages)
+# gridImages.to_csv('gridImages_{i}.csv'.format(i=num))
+
+   
+#we need to refer to this object as py$gridImages in the R session
+#we need to change this for every iteration
+
+```
+
+
+Unfortunately each time we need to predict the PCR from image features, we will need to put in column names. 
+```{r}
+ target<-c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18", "X19", "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28", "X29", "X30", "X31", "X32", "X33", "X34", "X35", "X36", "X37", "X38", "X39", "X40", "X41", "X42", "X43", "X44", "X45", "X46", "X47", "X48", "X49", "X50", "X51", "X52", "X53", "X54", "X55", "X56", "X57", "X58", "X59", "X60", "X61", "X62", "X63", "X64", "X65", "X66", "X67", "X68", "X69", "X70", "X71", "X72", "X73", "X74", "X75", "X76", "X77", "X78", "X79", "X80", "X81", "X82", "X83", "X84", "X85", "X86", "X87", "X88", "X89", "X90", "X91", "X92", "X93", "X94", "X95", "X96", "X97", "X98", "X99", "X100", "X101", "X102", "X103", "X104", "X105", "X106", "X107", "X108", "X109", "X110", "X111", "X112", "X113", "X114", "X115", "X116", "X117", "X118", "X119", "X120", "X121", "X122", "X123", "X124", "X125", "X126", "X127", "X128", "X129", "X130", "X131", "X132", "X133", "X134", "X135", "X136", "X137", "X138", "X139", "X140", "X141", "X142", "X143", "X144", "X145", "X146", "X147", "X148", "X149", "X150", "X151", "X152", "X153", "X154", "X155", "X156", "X157", "X158", "X159", "X160", "X161", "X162", "X163", "X164", "X165", "X166", "X167", "X168", "X169", "X170", "X171", "X172", "X173", "X174", "X175", "X176", "X177", "X178", "X179", "X180", "X181", "X182", "X183", "X184", "X185", "X186", "X187", "X188", "X189", "X190", "X191", "X192", "X193", "X194", "X195", "X196", "X197", "X198", "X199", "X200", "X201", "X202", "X203", "X204", "X205", "X206", "X207", "X208", "X209", "X210", "X211", "X212", "X213", "X214", "X215", "X216", "X217", "X218", "X219", "X220", "X221", "X222", "X223", "X224", "X225", "X226", "X227", "X228", "X229", "X230", "X231", "X232", "X233", "X234", "X235", "X236", "X237", "X238", "X239", "X240", "X241", "X242", "X243")
+
+```
+
+
+
+Bayesian Optimization Scenario 4: Have to add another scenario where you only do gridToUse search 5x on one gridToUse. But predict all the data first and just get the outcome using index. 
+```{r message=FALSE, warning=FALSE}
+rm('bayesian_optimization_withgrid_iter2')
+source_python('bayesian_optimization_real_withGrid3.py')
+
+#set some parameters here
+exp = 50
+offset = 5
+gridToUse <- as.data.frame(read_csv(glue("gridImages_4.csv"))[2:244])
+names(gridToUse)  <- target
+maxiter = nrow(gridToUse)-1
+#maxiter = 6
+      
+
+for(g in 1:2){
+   geomData <- subset(allData, allData$Geometry_Number == g)
+   xraw = as.data.frame(geomData[,18:260])
+   names(xraw)[1] <- "X1"
+   xmean = lapply(xraw,mean)
+   xsd = lapply(xraw, sd)
+   x = as.data.frame((xraw-xmean)/xsd)
+   yraw = as.data.frame(geomData[,14:17])
+   ylog = log(yraw, 10)
+   ymax = unlist(lapply(ylog, max))
+   y = ylog/ymax
+   
+   modelToUse <- get(glue("studentModel_geneMultiResponse_geom{g}"))
+   
+   
+   #get the predicted PCR from this now
+   predictedGrid_raw_geom <- as.data.frame(predict(modelToUse, newdata=gridToUse, draws=50))
+   predictedGrid_sum_geom<- as.data.frame(log10(10^(predictedGrid_raw_geom[,1]*ymax[1]) + (10^(predictedGrid_raw_geom[,5]*ymax[2]))*1.684 + (10^(predictedGrid_raw_geom[,9]*ymax[3]))*2.939 + (10^(predictedGrid_raw_geom[,13]*ymax[4]))*2.206))[,1]
+   predictedGrid_sum_geom <- as.data.frame(predictedGrid_sum_geom)
+   names(predictedGrid_sum_geom) <- c("PredictedWeightedSum")
+
+   allTopoToPcrGridMaxData_s4 <- NULL
+   indexBayesOptMax_s4 <- NULL
+   indexRndMax_s4 <- NULL
+   
+   for (num in 1:exp){
+      predictedy_bayesopt <- NULL
+      predictedy_rnd <- NULL
+      holderBayesopt <- NULL
+      holderRnd <- NULL
+      y_best_bayesopt_iter <- NULL
+      y_best_rnd_iter <- NULL
+      all_ymax_bayesopt <- NULL
+      all_ymax_rnd <- NULL
+      active_ind_bayesopt <- NULL
+      active_ind_rnd <- NULL
+      all_experiment <- NULL
+      all_iterations <- NULL
+      holderIndexBayesOptMax <- NULL
+      holderIndexRndMax <- NULL
+      #kern_bayesopt <- get(glue("kern_bayesopt_{g}"))
+      #kern_rnd <- get(glue("kern_rnd_{g}"))
+
+      #initialize bayes opt from the known data set only, not the gridToUse!
+      set.seed(num*12)
+      
+      #for choosing a random initialization point using the empirical dataset that we have
+      #ind_initialize <- sample(0:nrow(x)-1, 1, replace=F)
+      #x_single <- t(matrix(x[ind_initialize[[1]]+1,], dimnames=NULL))
+      #colnames(x_single) <- colnames(gridToUse)
+      #x_single <- as.list(x_single)
+      #y_single <- y[ind_initialize[[1]]+1,]
+      
+      #choosing a random initialization point from the gridToUse
+      ind_new_bayesopt = list(sample(0:nrow(gridToUse), 1, replace=F))
+      ind_new_rnd = list(sample(0:nrow(gridToUse), 1, replace=F))
+      
+      predictedy_bayesopt <- as.data.frame(predictedGrid_sum_geom[ind_new_bayesopt[[1]]+1,])
+      predictedy_rnd  <- as.data.frame(predictedGrid_sum_geom[ind_new_rnd[[1]]+1,])
+
+      active_ind_bayesopt <- ind_new_bayesopt
+      active_ind_rnd <- ind_new_rnd
+      all_iterations <- 0
+      all_ymax_bayesopt  <- predictedy_bayesopt
+      all_ymax_rnd  <- predictedy_rnd
+      all_experiment <- num
+      
+      print(paste0("Experiment:", num)) 
+
+      for (i in 1:maxiter) {
+            
+            res_4  <- bayesian_optimization_withgrid_iter2(gridx = gridToUse, ally_bayesopt = predictedy_bayesopt, ally_rnd = predictedy_rnd, all_activeind_bayesopt = active_ind_bayesopt, all_activeind_rnd=active_ind_rnd, kernel_bayesopt=kern_bayesopt, kernel_rnd=kern_rnd, n_offset_bayesopt=offset, counter=i)
+            
+            ind_new_bayesopt  <- unlist(res_4[[3]])
+            ind_new_rnd  <- unlist(res_4[[4]])
+            y_best_bayesopt_iter  <- res_4[[5]]$values[1]
+            y_best_rnd_iter  <- res_4[[6]]$values[1]
+            kern_bayesopt  <- res_4[[7]]
+            kern_rnd  <- res_4[[8]]
+            all_ymax_bayesopt  <- rbind(all_ymax_bayesopt, y_best_bayesopt_iter)
+            all_ymax_rnd  <- rbind(all_ymax_rnd, y_best_rnd_iter)
+            all_experiment  <- rbind(all_experiment, num) 
+            all_iterations  <-  rbind(all_iterations, i)
+            active_ind_bayesopt  <- rbind(active_ind_bayesopt, res_4[[3]])
+            active_ind_rnd  <- rbind(active_ind_rnd, res_4[[4]])
+
+            predictedy_bayesopt <- rbind(predictedy_bayesopt, predictedGrid_sum_geom[ind_new_bayesopt[[1]]+1,])
+            predictedy_rnd  <- rbind(predictedy_rnd, predictedGrid_sum_geom[ind_new_rnd[[1]]+1,])
+            
+            #print(ind_bayesopt)
+            #print(y_best_bayesopt_iter)
+            print(glue("Iteration: {i}, Experiment: {num}, Geometry: {g}"))
+      }
+   
+         #does the data holder match the last data that we get?
+         holderMaxData <- bind_cols(ymax_bayesopt = all_ymax_bayesopt, ymax_rnd = all_ymax_rnd, iterations = all_iterations, experiment = all_experiment, bayesopt_index = unlist(active_ind_bayesopt), predictedBayesOpt = predictedy_bayesopt, random_index = unlist(active_ind_rnd), predictedRnd = predictedy_rnd)
+         holderMaxData$geometry <- g
+         names(holderMaxData) <- c("ymax_bayesopt", "ymax_rnd", "iterations", "experiment", "bayesopt_index", "predictedBayesOpt", "random_index", "predictedRnd", "geometry")
+         allTopoToPcrGridMaxData_s4 <- bind_rows(allTopoToPcrGridMaxData_s4, holderMaxData)
+         
+         holderIndexBayesOptMax <- rbind(holderIndexBayesOptMax,  min(which(holderMaxData$ymax_bayesopt == max(holderMaxData$ymax_bayesopt))))
+         holderIndexBayesOptMax <- as.data.frame(holderIndexBayesOptMax)
+         holderIndexBayesOptMax$geometry <- g
+         indexBayesOptMax_s4 <- rbind(indexBayesOptMax_s4, holderIndexBayesOptMax)
+   
+         holderIndexRndMax <- rbind(holderIndexRndMax,  min(which(holderMaxData$ymax_rnd == max(holderMaxData$ymax_rnd))))
+         holderIndexRndMax <- as.data.frame(holderIndexRndMax)
+         holderIndexRndMax$geometry <- g
+         indexRndMax_s4 <- rbind(indexRndMax_s4, holderIndexRndMax)
+   }
+   
+   assign(glue("allTopoToPcrGridMaxData_s4_geom{g}"), allTopoToPcrGridMaxData_s4)
+   assign(glue("indexBayesOptMax_s4_geom{g}"), indexBayesOptMax)
+   assign(glue("indexRndMax_s4_geom{g}"), indexRndMax)
+   write.csv(allTopoToPcrGridMaxData_s4, file=glue("allTopoToPcrGridMaxData_s4_geom{g}.csv"))
+   write.csv(indexBayesOptMax, file=glue("indexBayesOptMax_s4_geom{g}.csv"))
+   write.csv(indexRndMax, file=glue("indexRndMax_s4_geom{g}.csv"))
+}
+
+combinedGeom_allTopoToPcrGridMaxData_s4 <- rbind(allTopoToPcrGridMaxData_s4_geom1, allTopoToPcrGridMaxData_s4_geom2)
+combinedGeom_allTopoToPcrGridMaxData_s4$ExptGeomCombo <- paste0(combinedGeom_allTopoToPcrGridMaxData_s4$geometry, sep="_", combinedGeom_allTopoToPcrGridMaxData_s4$experiment)
+combinedGeom_allTopoToPcrGridMaxData_s4$ExptGeomComboArrange <- factor(combinedGeom_allTopoToPcrGridMaxData_s4$ExptGeomCombo, levels=c("1_1", "1_2", "1_3", "1_4", "1_5", "2_1", "2_2", "2_3", "2_4", "2_5"))
+
+meltDataYmaxGrid_s4 <- melt(combinedGeom_allTopoToPcrGridMaxData_s4[c(1,2,3,9,11)], value.name = "ymax", variable.name = "type", id.vars=c("geometry", "ExptGeomComboArrange", "iterations"))
+
+ggplot(meltDataYmaxGrid_s4, aes(x = iterations, y = ymax, color = type)) +
+   facet_wrap(~ExptGeomComboArrange, scales="free") +
+   geom_point() +
+   geom_line() +
+   labs(title="Bayesian Optimization for searching \n gridToUse of new topographies \n without the empirical dataset (Scenario 4)")
+
+```
+
+
+```{r}
+averageData_s4 <- meltDataYmaxGrid_s4 %>% 
+    group_by(iterations, type, geometry) %>% 
+    summarise(mean.value=mean(ymax), stdev.value = sd(ymax))
+
+ggplot(averageData_s4, aes(x = iterations, y = mean.value, color = type)) + 
+   facet_wrap(~geometry, scales="free") +
+   geom_errorbar(aes(ymin = mean.value - stdev.value, ymax = mean.value + stdev.value), alpha=0.5) + 
+   geom_point() + 
+   geom_line() +
+   theme_bw() +
+   labs(title="Bayesian Optimization for searching \n gridToUse of new topographies \n without the empirical dataset and \n using only one gridToUse for all experiments (Scenario 4)")
+```
+
+
+```{r}
+ggplot(meltDataYmaxGrid_s4, aes(x = ymax, color = type)) + 
+   geom_density(stat="density") + 
+   facet_wrap(~geometry, scales="free") +
+   theme_bw() + 
+   labs(title="Bayesian Optimization for searching \n gridToUse of new topographies \n without the empirical dataset and \n using only one gridToUse for all experiments (Scenario 4)")
+```
+
+
+```{r}
+library(sm)
+subsetGeom1 <- subset(meltDataYmaxGrid_s4, meltDataYmaxGrid_s4$geometry==1)
+pdf(glue("topoToPCR_density_geom1_s4.pdf"))
+sm.density.compare(subsetGeom1$ymax, subsetGeom1$type, xlab="Geometry HEX_s1")
+dev.off()
+subsetGeom2 <- subset(meltDataYmaxGrid_s4, meltDataYmaxGrid_s4$geometry==2)
+pdf(glue("topoToPCR_density_geom2_s4.pdf"))
+sm.density.compare(subsetGeom2$ymax, subsetGeom2$type, xlab="Geometry SQ_s1")
+dev.off()
+```
+
+```{r}
+for (g in 1:2){
+   averageDataSubset_s4 <- subset(averageData_s4, averageData_s4$geometry == g)
+   yMaxIndex<-which(averageDataSubset_s4$mean.value==max(averageDataSubset_s4$mean.value))
+   BayesOptMaxIndex <- averageDataSubset_s4[min(yMaxIndex[lapply(yMaxIndex, "%%", 2)!=0]), 1]
+   RndMaxIndex <- averageDataSubset_s4[min(yMaxIndex[lapply(yMaxIndex, "%%", 2)==0]), 1]
+   print(glue("Max iterations needed by Bayes Opt to get to optimum of geometry {g} is {BayesOptMaxIndex}"))
+   print(glue("Max iterations needed by Rnd to get to optimum of geometry {g} is {RndMaxIndex}"))
+}
+```
+
+From the selected gridToUse that we explored in scenario 4, what is the topography that should be the best one to try? 
+Because there's only one gridToUse that we explored anyway, we only need to output two different topographies: a HEX and SQ topography that will lead to max morphome.
+PLEASE MAKE SURE THAT THE gridToUse YOU USE HERE IS EXACTLY THE SAME AS THE ONE THAT YOU USED IN THE S4 BAYES OPT PART
+```{r}
+
+indexGeom1 <- min(which(allTopoToPcrGridMaxData_s4_geom1$ymax_bayesopt==max(allTopoToPcrGridMaxData_s4_geom1$ymax_bayesopt)))+1
+indexGeom2 <- min(which(allTopoToPcrGridMaxData_s4_geom2$ymax_bayesopt==max(allTopoToPcrGridMaxData_s4_geom2$ymax_bayesopt)))+1
+geom1holder  <- gridToUse[indexGeom1, ]
+geom2holder  <- gridToUse[indexGeom2, ]
+topogeom1_s4 <- predict(studentTModel_base_topoPrediction_geom1, newdata = geom1holder, draws=50)
+topogeom2_s4 <- predict(studentTModel_base_topoPrediction_geom2, newdata = geom1holder, draws=50)
+   
+#which one should we use? which dataset did we use for the linear regression? by Max data?
+topogeom1_s4_rescale <- bind_cols(Disorder = topogeom1_s4[1]*1000, Diameter = topogeom1_s4[5]*2000)
+topogeom2_s4_rescale <- bind_cols(Disorder = topogeom2_s4[1]*1000, Diameter = topogeom2_s4[5]*2000)
+
+#topogeom1_s4_rescale2 <- bind_cols(Disorder = topogeom1_s4[1]*238.8+132.1, Diameter = topogeom1_s4[5]*589.7+401.14)
+#topogeom2_s4_rescale2 <- bind_cols(Disorder = topogeom2_s4[1]*238.8+132.1, Diameter = topogeom2_s4[5]*589.7+401.14)
+
+#Disorder = topoRnd[,1]*238.8+132.1, Diameter = topoRnd[,2]*589.7+401.14
+
+print(glue("The HEX geometry has Disorder of {topogeom1_s4_rescale[,1]} and Diameter of {topogeom1_s4_rescale[,2]}"))
+print(glue("The SQ geometry has Disorder of {topogeom2_s4_rescale[,1]} and Diameter of {topogeom2_s4_rescale[,2]}"))
+
+#print(glue("The HEX geometry has Disorder of {topogeom1_s4_rescale2[,1]} and Diameter of {topogeom1_s4_rescale2[,2]}"))
+#print(glue("The SQ geometry has Disorder of {topogeom2_s4_rescale2[,1]} and Diameter of {topogeom2_s4_rescale2[,2]}"))
+
+```
+
+
+
